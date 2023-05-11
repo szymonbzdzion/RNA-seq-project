@@ -1,0 +1,652 @@
+---
+title: "RNA-seq"
+author: "Szymon Bzdzion"
+date: "2023-05-02"
+output: html_document
+---
+
+# RNA-seq analysis of publicly available data from GEO.
+
+### Title of the study: MacroH2A2 knockdown vs control RNA-seq in primary glioblastoma cells
+
+
+GEO accesion number: GSE149324
+
+**Summary**: Self-renewal is a crucial property of glioblastoma cells and is enabled by the choreographed function of chromatin regulators and transcription factors. Identifying targetable epigenetic mechanisms of self-renewal could represent an important step toward developing new and effective treatments for this universally lethal cancer. Here we uncover a targetable epigenetic axis of self-renewal mediated by the histone variant macroH2A2.
+
+I downloaded data with using `fasterq-dump` tool
+
+```{bash eval=FALSE}
+fasterq-dump SRR11607121
+fasterq-dump SRR11607122
+fasterq-dump SRR11607123
+fasterq-dump SRR11607124
+fasterq-dump SRR11607125
+fasterq-dump SRR11607126
+```
+
+## Quality control and trimming
+
+Then I performed quality control with `fastqc`
+
+```{bash eval=FALSE}
+fastqc *.fastq
+```
+
+Overall quality was good
+
+```{r echo=FALSE}
+knitr::include_graphics("E:/Studia/Coding/Project/RNA-seq/fastqc.png")
+```
+
+and adapter sequences were already trimmed
+
+```{r echo=FALSE}
+knitr::include_graphics("E:/Studia/Coding/Project/RNA-seq/adapters.png")
+```
+
+I decided to do quality trimming
+
+```{bash eval=FALSE}
+trimmomatic SE SRR11607121.fastq SRR11607121_trim.fq SLIDINGWINDOW:4:30 
+trimmomatic SE SRR11607122.fastq SRR11607122_trim.fq SLIDINGWINDOW:4:30
+trimmomatic SE SRR11607123.fastq SRR11607123_trim.fq SLIDINGWINDOW:4:30
+trimmomatic SE SRR11607124.fastq SRR11607124_trim.fq SLIDINGWINDOW:4:30
+trimmomatic SE SRR11607125.fastq SRR11607125_trim.fq SLIDINGWINDOW:4:30
+trimmomatic SE SRR11607126.fastq SRR11607126_trim.fq SLIDINGWINDOW:4:30
+```
+
+After that i checked the quality again
+
+```{r echo=FALSE}
+knitr::include_graphics("E:/Studia/Coding/Project/RNA-seq/trimmed_qc.png")
+```
+
+## Transcript quantification
+
+After trimming I used `Salmon` to quantify the transcripts
+
+While creating the index, I used `--gencode` flag to get more information from the transcript names
+
+```{bash eval=FALSE}
+salmon index --gencode -t gencode.v43.transcripts.fa.gz -i HS_index
+```
+
+Then I quantified transcripts in every file
+
+```{bash eval=FALSE}
+salmon quant -i HS_index -l A \
+-r SRR11607121 -p 4 --validateMappings \
+-o ./quants/SRR11607121
+
+salmon quant -i HS_index -l A \
+-r SRR11607122 -p 4 --validateMappings \
+-o ./quants/SRR11607122
+
+salmon quant -i HS_index -l A \
+-r SRR11607123 -p 4 --validateMappings \
+-o ./quants/SRR11607123
+
+salmon quant -i HS_index -l A \
+-r SRR11607124 -p 4 --validateMappings \
+-o ./quants/SRR11607124
+
+salmon quant -i HS_index -l A \
+-r SRR11607125 -p 4 --validateMappings \
+-o ./quants/SRR11607125
+
+salmon quant -i HS_index -l A \
+-r SRR11607126 -p 4 --validateMappings \
+-o ./quants/SRR11607126
+
+```
+
+## Analysis in R
+
+First, I loaded the libraries
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(tximeta)
+library(tidybulk)
+library(tidySummarizedExperiment)
+library(pheatmap)
+library(viridis)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(genefilter)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+library(ggrepel)
+library(ggvenn)
+library(gprofiler2)
+```
+
+Then I loaded and prepared the metadata
+
+```{r}
+# read and manipulate the meta data
+setwd("E:/Studia/Coding/Project/RNA-seq/R_project")
+meta_data <- read.delim('metadata.csv', header = T, sep = ';')
+meta_data
+rownames(meta_data) <- meta_data$SRR
+colnames(meta_data)[1] <- 'names'
+meta_data
+
+# change wokring directory 
+setwd("E:/Studia/Coding/Project/RNA-seq")
+
+# find the RNA-seq files
+list.files(file.path(getwd(), 'Mapping/quants'))
+
+#add files path to meta data
+meta_data$files <- file.path(getwd(), 'Mapping/quants', meta_data$names, 'quant.sf')
+```
+
+I used the `tximeta` package to load the transcripts data, then I mapped transcripts to genes to perform analysis on the gene level
+
+```{r}
+# load the RNA-seq data
+se <- tximeta(meta_data)
+
+
+
+# summarize transcripts to genes
+gse <- summarizeToGene(se)
+gse
+# save the SummarizedExperiment 
+#saveRDS(gse ,'gse.RDS')
+```
+
+The next step was exploring the data and preparing it for further analysis
+
+```{r}
+# explore the data
+assayNames(gse)
+
+head(assay(gse))
+
+colSums(assay(gse))
+
+rowRanges(gse)
+
+seqinfo(rowRanges(gse))
+
+colData(gse)
+
+
+# change columns to factors
+gse$group <- factor(gse$group)
+gse$treatment <- factor(gse$treatment)
+
+#relevel group column - set the reference level
+levels(gse$group)
+gse$group <- relevel(gse$group, ref = 'shScr')
+
+
+# check reads in milions
+round( colSums(assay(gse)) / 1e6, 1)
+```
+
+I created the `DESeqDataSet` filtered the data and performed variance stabilization with two methods `vst` and `rlog` - to prepare the data for EDA
+
+```{r}
+# create DESeqDataSet
+dds <- DESeqDataSet(gse, design = ~ group)
+dds
+
+# filter the data - keep only genes with enough reads
+keep <- rowSums(counts(dds) >= 10) >= 2
+dds <- dds[keep, ]
+dds
+
+
+# variance stabilization - transformation for EDA
+vsd <- vst(dds, blind = F)
+
+rld <- rlog(dds, blind = F)
+```
+
+I examined the variance to pick a better method for further visualization
+
+```{r}
+# visualize variance
+dds <- estimateSizeFactors(dds)
+
+df <- bind_rows(
+  as_data_frame(log2(counts(dds, normalized=TRUE)[,1:2] + 1)) %>% mutate(transformation = 'log2(x+1)'),
+  as_data_frame(assay(vsd)[,1:2]) %>% mutate(transformation = 'vst'),
+  as_data_frame(assay(rld)[,1:2]) %>% mutate(transformation = 'rlog')
+)
+colnames(df)[1:2] <- c("x", 'y') 
+
+lvls <- c("log2(x + 1)", "vst", "rlog")
+df$transformation <- factor(df$transformation, levels=lvls)
+
+ggplot(df, aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation)  
+```
+
+Data after `rlog` transformation looked better so I decided to use this data for further exploration
+
+I checked the distance between samples using `dist` and `pheatmap`
+
+```{r}
+#check distance between samples
+sample_dists <- dist(t(assay(rld)))
+sample_dists
+
+sample_dists <- as.matrix(sample_dists)
+colnames(sample_dists) <- dds$group
+rownames(sample_dists) <- dds$group
+
+pheatmap(sample_dists, color = rev(viridis::rocket(100)))
+```
+
+As expected control samples (shScr) were closer to each other than to test samples. Similarly, test samples of the same type had a lower distance to each other than test samples of different type.
+
+### PCA analysis
+
+I made PCA plot to examine the differences between samples
+
+```{r}
+plotPCA(rld, intgroup = c('treatment', 'group'))
+
+
+rm(se, meta_data)
+```
+
+The results were similar to the distance heatmap. The biggest difference was between control and test samples (PC1), but there was also some difference between types of knockout (PC2)
+
+## Results
+
+### control vs shB
+
+I performed differential expression analysis (using `DESeq` function) and got the results using `lfcShrink` to shrink LFC estimates for genes with very low counts and high variable counts
+
+```{r}
+# differential expression analysis
+dds <- DESeq(dds)
+
+
+#get the results
+res_ctrl_B <- results(dds)
+
+#shrinking log fold changes for visualization and functional enrichment
+res_ctrl_B_df <- lfcShrink(dds, coef = 'group_shH2AFY2b_vs_shScr', type = 'apeglm')
+res_ctrl_B_df <- as_tibble(res_ctrl_B, rownames = 'ENSEMBL')
+res_ctrl_B_df %>%
+  arrange(padj)
+```
+
+I added the column with symbols mapping ENSEMBL IDs to gene symbols\
+I also added a threshold column for the volcano plot and sorted the data frame
+
+```{r}
+# check database
+org.Hs.eg.db
+keytypes(org.Hs.eg.db)
+
+# remove version digits from ENSEMBL name
+res_ctrl_B_df$ENSEMBL <- gsub('\\.\\d+', "", res_ctrl_B_df$ENSEMBL)
+
+# map ENSEMBL IDs to gene symbols
+res_ctrl_B_df$symbol <- mapIds(org.Hs.eg.db, keys = res_ctrl_B_df$ENSEMBL, keytype = 'ENSEMBL', column = 'SYMBOL')
+
+# check top significant genes
+res_ctrl_B_df %>%
+  arrange(padj)
+
+# add threshold column
+res_ctrl_B_df <- res_ctrl_B_df %>%
+  mutate(threshold = (log2FoldChange > 2 & padj < 0.05) | (log2FoldChange < -2 & padj < 0.05))
+# order the data frame
+res_ctrl_B_df <- res_ctrl_B_df %>%
+  arrange(padj)
+
+res_ctrl_B_df
+```
+
+Volcano plot
+
+```{r}
+
+# volcano plot - control vs shB
+ggplot(res_ctrl_B_df, aes(log2FoldChange, -log10(padj), color = threshold)) +
+  geom_point() +
+  geom_vline(xintercept = 2, linetype = 2, color = '#35978F')+
+  geom_vline(xintercept = -2, linetype = 2, color = '#35978F') +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, color = "#35978F")+
+  geom_text_repel(data = res_ctrl_B_df[1:10,],aes(log2FoldChange, -log10(padj), label = symbol), size = 4) +
+  scale_color_manual(values = c('gray80', "#35978F"), guide="none") +
+  xlim(-10, 10) +
+  ylim(0, 200) +
+  labs(x='log2(fold change)', y='-log10(adjusted p value)') +
+  theme_minimal()
+```
+
+The results table and volcano plot showed that among other genes: COL20A1, H19, and COL2A1 were upregulated and UNC13A was downregulated in shH2AFY2b compared to control samples
+
+## I did the same analysis for different comparisons - here are the results
+
+### control vs shA
+
+```{r}
+# get the results
+res_ctrl_A <- results(dds, contrast = c("group", "shScr", "shH2AFY2a"))
+res_ctrl_A
+# change to data frame
+res_ctrl_A_df <- lfcShrink(dds, coef = 'group_shH2AFY2a_vs_shScr', type = 'apeglm')
+res_ctrl_A_df <- as_tibble(res_ctrl_A, rownames = 'ENSEMBL')
+res_ctrl_A_df %>%
+  arrange(padj)
+
+
+# remove gene version digits from ENSEMBLE IDs
+res_ctrl_A_df$ENSEMBL <- gsub('\\.\\d+', "", res_ctrl_A_df$ENSEMBL)
+
+# map ENSEMBLE IDs to gene symbols
+res_ctrl_A_df$symbol <- mapIds(org.Hs.eg.db, keys = res_ctrl_A_df$ENSEMBL, keytype = 'ENSEMBL', column = 'SYMBOL')
+
+res_ctrl_A_df %>%
+  arrange(padj)
+
+# add threshold data
+res_ctrl_A_df <- res_ctrl_A_df %>%
+  mutate(threshold = (log2FoldChange > 2 & padj < 0.05) | (log2FoldChange < -2 & padj < 0.05))
+# order the data frame 
+res_ctrl_A_df <- res_ctrl_A_df %>%
+  arrange(padj)
+res_ctrl_A_df
+
+
+# volcano plot - control vs A
+ggplot(res_ctrl_A_df, aes(log2FoldChange, -log10(padj), color = threshold)) +
+  geom_point() +
+  geom_vline(xintercept = 2, linetype = 2, color = '#35978F')+
+  geom_vline(xintercept = -2, linetype = 2, color = '#35978F') +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, color = "#35978F")+
+  geom_text_repel(data = res_ctrl_A_df[1:10,],aes(log2FoldChange, -log10(padj), label = symbol), size = 4) +
+  scale_color_manual(values = c('gray80', "#35978F"), guide="none") +
+  xlim(-10, 10) +
+  ylim(0, 200) +
+  labs(x='log2(fold change)', y='-log10(adjusted p value)') +
+  theme_minimal()
+
+```
+
+In shH2AFY2a compared to control:\
+Upregulated: RPS4Y1, CSMD1, NLGN4Y\
+Downregulated: COL20A1, HAPLN1, COL2A1, ITGA10
+
+### shA vs shB
+
+```{r}
+#get the results
+res_A_B <- results(dds, contrast = c('group', 'shH2AFY2a', 'shH2AFY2b'))
+res_A_B
+
+# to data frame
+res_A_B_df <- as_tibble(res_A_B, rownames = 'ENSEMBL')
+res_A_B_df %>%
+  arrange(padj)
+
+# ENSEMBL digits
+res_A_B_df$ENSEMBL <- gsub('\\.\\d+', "", res_A_B_df$ENSEMBL)
+
+# map ids
+res_A_B_df$symbol <- mapIds(org.Hs.eg.db, keys = res_A_B_df$ENSEMBL, keytype = 'ENSEMBL', column = 'SYMBOL')
+
+res_A_B_df %>%
+  arrange(padj)
+
+# add threshold column
+res_A_B_df <- res_A_B_df %>%
+  mutate(threshold = (log2FoldChange > 2 & padj < 0.05) | (log2FoldChange < -2 & padj < 0.05))
+
+#order the data
+res_A_B_df <- res_A_B_df %>%
+  arrange(padj)
+res_A_B_df
+
+# volcano plot - shA vs shB
+ggplot(res_A_B_df, aes(log2FoldChange, -log10(padj), color = threshold)) +
+  geom_point() +
+  geom_vline(xintercept = 2, linetype = 2, color = '#35978F')+
+  geom_vline(xintercept = -2, linetype = 2, color = '#35978F') +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, color = "#35978F")+
+  geom_text_repel(data = res_A_B_df[1:10,],aes(log2FoldChange, -log10(padj), label = symbol), size = 4) +
+  scale_color_manual(values = c('gray80', "#35978F"), guide="none") +
+  xlim(-10, 10) +
+  ylim(0, 300) +
+  labs(x='log2(fold change)', y='-log10(adjusted p value)') +
+  theme_minimal()
+
+
+```
+
+## I also compared all control vs treatment samples without spliting for knockout type
+
+```{r}
+# create new DESeqDataSet
+dds_treatment <- DESeqDataSet(gse, design = ~ treatment)
+dds_treatment
+
+#filter the data
+keep <- rowSums(counts(dds_treatment) >= 10) >= 2
+dds_treatment <- dds_treatment[keep, ]
+
+
+# differnatial expression analysis
+dds_treatment <- DESeq(dds_treatment)
+
+# get the results
+res_treatment <- results(dds_treatment)
+res_treatment
+
+# shrink LFC for better visualization
+res_treatment_df <- lfcShrink(dds_treatment, coef = c('treatment_knockdown_vs_control'), type = 'apeglm')
+res_treatment_df
+
+
+
+# create data frame for results
+res_treatment_df <- as_tibble(res_treatment_df, rownames = 'ENSEMBL')
+res_treatment_df %>%
+  arrange(padj)
+
+
+# remove digits
+res_treatment_df$ENSEMBL <- gsub('\\.\\d+', "", res_treatment_df$ENSEMBL)
+
+# map ENSEMBL IDs to gene symbols
+res_treatment_df$symbol <- mapIds(org.Hs.eg.db, keys = res_treatment_df$ENSEMBL, keytype = 'ENSEMBL', column = 'SYMBOL')
+
+#check
+res_treatment_df %>%
+  arrange(padj)
+
+# add thershold column
+res_treatment_df <- res_treatment_df %>%
+  mutate(threshold = (log2FoldChange > 2 & padj < 0.05) | (log2FoldChange < -2 & padj < 0.05))
+# order the data frame
+res_treatment_df <- res_treatment_df %>%
+  arrange(padj)
+res_treatment_df
+
+
+# volcano plot - control vs treatment
+ggplot(res_treatment_df, aes(log2FoldChange, -log10(padj), color = threshold)) +
+  geom_point() +
+  geom_vline(xintercept = 2, linetype = 2, color = '#35978F')+
+  geom_vline(xintercept = -2, linetype = 2, color = '#35978F') +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, color = "#35978F")+
+  geom_text_repel(data = res_treatment_df[1:10,],aes(log2FoldChange, -log10(padj), label = symbol), size = 4) +
+  scale_color_manual(values = c('gray80', "#35978F"), guide="none") +
+  xlim(-10, 10) +
+  ylim(0, 300) +
+  labs(x='log2(fold change)', y='-log10(adjusted p value)') +
+  theme_minimal()
+```
+
+## Heatmap
+
+I picked 50 genes with the biggest variance across the samples and made the heatmap (`ComplexHeatmap` package)
+
+```{r fig.height=12, fig.width=8}
+# get top variable genes
+topVarGenes <- head(order(rowVars(assay(rld)), decreasing = TRUE), 50)
+
+
+# make heatmap with pheatmap package
+mat <- assay(rld)[topVarGenes, ]
+mat <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(rld)[,c('group', 'treatment')])
+rownames(mat) <- gsub('\\.\\d+', "", rownames(mat))
+symbols <- res_treatment_df[which(res_treatment_df$ENSEMBL %in% rownames(mat)), ]$symbol
+
+# choose the colors
+pal_1 <- rep(brewer.pal(3,'Set2'), each=2)
+names(pal_1) <- anno$group
+
+pal_2 <- rep(brewer.pal(3, 'Accent')[1:2], c(2,4))
+names(pal_2) <- anno$treatment
+
+# create named list of colors
+cols <- list(pal_1, pal_2)
+names(cols) <- c('group', 'treatment')
+
+#create annotation data frame
+anno <- as.data.frame(colData(rld)[,c('group', 'treatment')])
+anno <- HeatmapAnnotation(df = anno, col = cols)
+
+#make Heatmap
+Heatmap(mat, col = (viridis::rocket(100)), row_labels = symbols, top_annotation = anno)
+```
+
+## Venn diagram
+
+```{r}
+#prepare the data
+
+res_ctrl_B_top <- res_ctrl_B_df %>%
+  filter((log2FoldChange > 2 & padj < 0.05) | (log2FoldChange < -2 & padj < 0.05))
+res_ctrl_B_top <- res_ctrl_B_top$symbol
+res_ctrl_A_top <- res_ctrl_A_df %>%
+  filter((log2FoldChange > 2 & padj < 0.05) | (log2FoldChange < -2 & padj < 0.05))
+res_ctrl_A_top <- res_ctrl_A_top$symbol
+res_A_B_df_top <- res_A_B_df %>%
+  filter((log2FoldChange > 2 & padj < 0.05) | (log2FoldChange < -2 & padj < 0.05))
+res_A_B_df_top <- res_A_B_df_top$symbol
+venn_list <- list('ctrl_vs_A' = res_ctrl_A_top, 'ctrl_vs_B' = res_ctrl_B_top, 'A_vs_B' = res_A_B_df_top)
+
+
+ggvenn(venn_list, c('ctrl_vs_A', 'ctrl_vs_B', 'A_vs_B'))
+```
+
+Common genes with significant changes between samples
+
+## Functional enrichment analysis
+
+I picked genes with significantly altered expression with log2 fold change bigger than 1\
+Then I mapped the symbol to ENTERZ ID in order to perform enrichment analysis with `clusterProfiler`
+
+```{r fig.width=7, fig.height=7}
+#get the top genes
+res_treat_top <- res_treatment_df %>%
+  arrange(padj, desc(log2FoldChange)) %>%
+  filter((log2FoldChange > 1 & padj < 0.05) | (log2FoldChange < -1 & padj < 0.05))
+
+# get the symbol and map it to Enterz ID
+res_treat_top <- res_treat_top$symbol
+res_teat_entrez <- mapIds(org.Hs.eg.db, keys = res_treat_top, keytype = 'SYMBOL', column = 'ENTREZID')
+
+# perform GO enrichment analysis
+ego <- enrichGO(res_teat_entrez, org.Hs.eg.db)
+
+dotplot(ego) + scale_color_gradientn(colors = viridis::viridis(100))
+
+```
+
+Analysis showed some interesting enriched pathways such as gated channel activity and neurotransmitter receptor activity (glioblastoma study) also growth factor binding (cancer-related pathway)
+
+### Further visualization
+
+```{r fig.width=18, fig.height=10}
+#visualization
+egox <- setReadable(ego, 'org.Hs.eg.db', "ENTREZID")
+
+res_treat_top <- res_treatment_df 
+
+FC_data <- res_treat_top$log2FoldChange
+
+cnetplot(egox, foldChange = FC_data, circular=T, colorEdge=T)
+
+sig_gene_er <- pairwise_termsim(ego)
+emapplot(sig_gene_er, cex_label_category = 0.8) 
+
+egox2 <- pairwise_termsim(egox)
+treeplot(egox2)
+
+```
+
+GO analysis with `gprofiler2`
+
+```{r fig.width=10, fig.height=10}
+res_treat_top <- res_treatment_df %>%
+  arrange(padj, desc(log2FoldChange)) %>%
+  filter((log2FoldChange > 1 & padj < 0.05) | (log2FoldChange < -1 & padj < 0.05))
+
+
+res_treat_top <- res_treat_top$symbol
+
+gprof_go <- gost(res_treat_top, organism = 'hsapiens', correction_method = 'fdr')
+
+
+#gostplot(gprof_go, interactive = T, capped = T)
+go_plot <- gostplot(gprof_go, interactive = F, capped = T)
+publish_gostplot(go_plot, 
+                 highlight_terms = c('GO:0007399', 'GO:0043005', 'GO:0045202', 'GO:0010646'))
+```
+
+## GSEA
+
+```{r}
+res_treat_top <- res_treatment_df
+
+
+
+gsea_data <- res_treat_top$log2FoldChange
+
+names(gsea_data) <- res_treat_top$symbol
+
+names(gsea_data) <- mapIds(org.Hs.eg.db, keys = names(gsea_data), keytype = 'SYMBOL', column = 'ENTREZID')
+
+gsea_data <- gsea_data[order(gsea_data, decreasing=T)]
+
+
+
+
+library(msigdbr)
+hs_c2 <-msigdbr(species = "Homo sapiens", category = 'C2')[,c('gs_name', 'entrez_gene')]
+
+gsea_C2 <- GSEA(gsea_data, TERM2GENE = hs_c2)
+
+
+dotplot(gsea_C2)
+
+gseaplot2(gsea_C2, geneSetID = 1, title = 'VERHAAK_GLIOBLASTOMA_PRONEURAL')
+
+hs_C8 <-msigdbr(species = "Homo sapiens", category = 'C8')[,c('gs_name', 'entrez_gene')]
+
+gsea_C8 <- GSEA(gsea_data, TERM2GENE = hs_C8)
+
+
+dotplot(gsea_C8)
+
+gseaplot2(gsea_C8, geneSetID = 1, title = 'DESCARTES_FETAL_CEREBELLUM_OLIGODENDROCYTES')
+```
+
+GSEA analysis showed among others gene set enrichment found in previous giloblastoma studies
